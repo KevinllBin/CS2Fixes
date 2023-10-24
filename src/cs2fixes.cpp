@@ -187,30 +187,44 @@ bool CS2Fixes::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool
 		return false;
 	}
 
-	addresses::Initialize(g_GameConfig);
+	bool bRequiredInitLoaded = true;
+
+	if (!addresses::Initialize(g_GameConfig))
+		bRequiredInitLoaded = false;
+
 	interfaces::Initialize();
+
+	if (!InitPatches(g_GameConfig))
+		bRequiredInitLoaded = false;
+
+	if (!InitDetours(g_GameConfig))
+		bRequiredInitLoaded = false;
+
+	g_gameEventManager = (IGameEventManager2 *)(CALL_VIRTUAL(uintptr_t, 91, g_pSource2Server) - 8);
+
+	if (!g_gameEventManager)
+	{
+		Panic("Failed to find GameEventManager\n");
+		bRequiredInitLoaded = false;
+	}
+
+	if (!bRequiredInitLoaded)
+		return false;
 
 	Message( "All hooks started!\n" );
 
 	UnlockConVars();
 	UnlockConCommands();
 
-	g_pEntitySystem = interfaces::pGameResourceServiceServer->GetGameEntitySystem();
+	if (late)
+	{
+		RegisterEventListeners();
+		g_pEntitySystem = interfaces::pGameResourceServiceServer->GetGameEntitySystem();
+	}
 
 	ConVar_Register(FCVAR_RELEASE | FCVAR_CLIENT_CAN_EXECUTE | FCVAR_GAMEDLL);
 
-	bool requiredInitLoaded = true;
-
-	if (!InitPatches(g_GameConfig))
-		requiredInitLoaded = false;
-
-	if (!InitDetours(g_GameConfig))
-		requiredInitLoaded = false;
-
-	if (!requiredInitLoaded)
-		return false;
-
-	g_playerManager = new CPlayerManager();
+	g_playerManager = new CPlayerManager(late);
 	g_pAdminSystem = new CAdminSystem();
 
 	// Steam authentication
@@ -230,10 +244,6 @@ bool CS2Fixes::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool
 	{
 		g_playerManager->CheckInfractions();
 	});
-
-	g_gameEventManager = (IGameEventManager2*)(CALL_VIRTUAL(uintptr_t, 91, g_pSource2Server) - 8);
-
-	Message("g_gameEventManager - %p\n", g_gameEventManager);
 
 	srand(time(0));
 
@@ -300,31 +310,47 @@ void CS2Fixes::Hook_PostEvent(CSplitScreenSlot nSlot, bool bLocalOnly, int nClie
 	INetworkSerializable* pEvent, const void* pData, unsigned long nSize, NetChannelBufType_t bufType)
 {
 	// Message( "Hook_PostEvent(%d, %d, %d, %lli)\n", nSlot, bLocalOnly, nClientCount, clients );
+	// Need to explicitly get a pointer to the right function as it's overloaded and SH_CALL can't resolve that
+	static void (IGameEventSystem::*PostEventAbstract)(CSplitScreenSlot, bool, int, const uint64 *,
+							INetworkSerializable *, const void *, unsigned long, NetChannelBufType_t) = &IGameEventSystem::PostEventAbstract;
 
-	NetMessageInfo_t* info = pEvent->GetNetMessageInfo();
+	NetMessageInfo_t *info = pEvent->GetNetMessageInfo();
 
-	//CMsgTEFireBullets
-	if (info->m_MessageId == GE_FireBulletsId || info->m_MessageId == TE_WorldDecalId)
+	if (info->m_MessageId == GE_FireBulletsId)
 	{
-		// Can later do a bit mask for players using stopsound but this will do for now
-		for (uint64 i = 0; i < MAXPLAYERS; i++)
+		if (g_playerManager->GetSilenceSoundMask())
 		{
-			ZEPlayer *pPlayer = g_playerManager->GetPlayer(i);
+			// Post the silenced sound to those who use silencesound
+			// Creating a new event object requires us to include the protobuf c files which I didn't feel like doing yet
+			// So instead just edit the event in place and reset later
+			CMsgTEFireBullets *msg = (CMsgTEFireBullets *)pData;
 
-			// A client might be already excluded from the event possibly due to being too far away, so ignore them
-			if (!(*(uint64 *)clients & ((uint64)1 << i)))
-				continue;
+			int32_t weapon_id = msg->weapon_id();
+			int32_t sound_type = msg->sound_type();
+			int32_t item_def_index = msg->item_def_index();
 
-			if (!pPlayer)
-				continue;
+			// original weapon_id will override new settings if not removed
+			msg->set_weapon_id(0);
+			msg->set_sound_type(10);
+			msg->set_item_def_index(61); // weapon_usp_silencer
 
-			if ((info->m_MessageId == GE_FireBulletsId && pPlayer->IsUsingStopSound()) || 
-				(info->m_MessageId == TE_WorldDecalId && pPlayer->IsUsingStopDecals()))
-			{
-				*(uint64*)clients &= ~((uint64)1 << i);
-				nClientCount--;
-			}
+			uint64 clientMask = *(uint64 *)clients & g_playerManager->GetSilenceSoundMask();
+
+			SH_CALL(g_gameEventSystem, PostEventAbstract)
+			(nSlot, bLocalOnly, nClientCount, &clientMask, pEvent, msg, nSize, bufType);
+
+			msg->set_weapon_id(weapon_id);
+			msg->set_sound_type(sound_type);
+			msg->set_item_def_index(item_def_index);
 		}
+
+		// Filter out people using stop/silence sound from the original event
+		*(uint64 *)clients &= ~g_playerManager->GetStopSoundMask();
+		*(uint64 *)clients &= ~g_playerManager->GetSilenceSoundMask();
+	}
+	else if (info->m_MessageId == TE_WorldDecalId)
+	{
+		*(uint64 *)clients &= ~g_playerManager->GetStopDecalsMask();
 	}
 }
 
@@ -407,10 +433,6 @@ void CS2Fixes::Hook_GameFrame( bool simulating, bool bFirstTick, bool bLastTick 
 	g_flLastTickedTime = gpGlobals->curtime;
 	g_bHasTicked = true;
 
-	if(!g_pEntitySystem)
-		g_pEntitySystem = interfaces::pGameResourceServiceServer->GetGameEntitySystem();
-
-
 	for (int i = g_timers.Tail(); i != g_timers.InvalidIndex();)
 	{
 		auto timer = g_timers[i];
@@ -451,14 +473,9 @@ void CS2Fixes::Hook_CheckTransmit(CCheckTransmitInfo **ppInfoList, int infoCount
 		// though this is probably part of the client class that contains the CCheckTransmitInfo
 		int iPlayerSlot = (int)*((uint8 *)pInfo + 560);
 
-		auto pPlayer = g_playerManager->GetPlayer(iPlayerSlot);
+		auto pSelfController = (CCSPlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)(iPlayerSlot + 1));
 
-		if (!pPlayer)
-			continue;
-
-		auto pSelfController = (CBasePlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)(pPlayer->GetPlayerSlot().Get() + 1));
-
-		if (!pSelfController)
+		if (!pSelfController || !pSelfController->IsConnected() || !pSelfController->m_bPawnIsAlive)
 			continue;
 
 		auto pSelfPawn = pSelfController->GetPawn();
@@ -466,9 +483,14 @@ void CS2Fixes::Hook_CheckTransmit(CCheckTransmitInfo **ppInfoList, int infoCount
 		if (!pSelfPawn || !pSelfPawn->IsAlive())
 			continue;
 
-		for (int i = 1; i <= MAXPLAYERS; i++)
+		auto pSelfZEPlayer = g_playerManager->GetPlayer(iPlayerSlot);
+
+		if (!pSelfZEPlayer)
+			continue;
+
+		for (int i = 1; i <= g_playerManager->GetMaxPlayers(); i++)
 		{
-			if (!pPlayer->ShouldBlockTransmit(i - 1))
+			if (!pSelfZEPlayer->ShouldBlockTransmit(i - 1))
 				continue;
 
 			auto pController = (CBasePlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)i);
