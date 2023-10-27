@@ -1,4 +1,4 @@
-name: Plugin build
+name: Build
 
 on:
   push:
@@ -14,13 +14,13 @@ jobs:
   linux:
     name: linux build
     runs-on: ubuntu-latest
-    env:
-      HL2SDKCS2: ${{ github.workspace }}/cs2fixes/sdk
-      CC: clang
-      CXX: clang++
     container:
       image: idk1703/build-img:11
     steps:
+      - name: Prepare env
+        shell: bash
+        run: echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
       - name: Checking out MM:Source
         uses: actions/checkout@v3
         with:
@@ -37,15 +37,24 @@ jobs:
       - name: Compiling files
         working-directory: cs2fixes
         run: |
+          export HL2SDKCS2=/__w/CS2Fixes-Build/CS2Fixes-Build/cs2fixes/sdk
           python3 configure.py --enable-optimize --symbol-files --sdks cs2
           ambuild objdir
+          
+      - name: Uploading package
+        uses: actions/upload-artifact@v3
+        with:
+          name: cs2fixes-linux-${{ env.GITHUB_SHA_SHORT }}
+          path: cs2fixes/objdir/package
 
   windows:
     name: windows build
     runs-on: windows-latest
-    env:
-      HL2SDKCS2: ${{ github.workspace }}/cs2fixes/sdk
     steps:
+      - name: Prepare env
+        shell: bash
+        run: |
+          echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
       - name: Setting up Python
         uses: actions/setup-python@v4
         with:
@@ -55,7 +64,6 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip setuptools wheel
           pip install git+https://github.com/alliedmodders/ambuild
-
       - name: Checking out MM:Source
         uses: actions/checkout@v3
         with:
@@ -72,5 +80,12 @@ jobs:
       - name: Compiling files
         working-directory: cs2fixes
         run: |
+          $env:HL2SDKCS2 = '${{ github.workspace }}/cs2fixes/sdk'
           python3 configure.py --enable-optimize --symbol-files --sdks cs2
           ambuild objdir
+          
+      - name: Uploading package
+        uses: actions/upload-artifact@v3
+        with:
+          name: cs2fixes-windows-${{ env.GITHUB_SHA_SHORT }}
+          path: cs2fixes/objdir/package
